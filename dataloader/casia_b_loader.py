@@ -18,6 +18,15 @@ class CASBDataset:
         self.all_subject_ids = sorted(list(self.all_sequences.keys()))
         print(f"Found {len(self.all_subject_ids)} subjects.")
 
+    def __call__(self, mode='train'):
+        """
+        让 FewShotSampler 可以像函数一样使用：
+        X_vis, X_struct, labels, cov_labels, phase_weights = sampler()
+
+        实际内部就是调用 get_episode()
+        """
+        return self.get_episode(mode)
+
     def _parse_data_structure(self):
         """
         解析目录结构: ID -> Condition -> View -> [Sequence_Paths]
@@ -92,44 +101,42 @@ class CASBDataset:
     def load_single_sample(self, silu_path, pose_path):
         """
         加载单个样本数据 (Visual + Structural)
+        现在 Visual 流返回模拟图像张量，可以直接送 ViT
         """
         # --- 1. 加载骨架 (Structural Stream) ---
+        target_len = 5
         if pose_path == 'dummy_pose':
-            x_struct = torch.randn(50, 68)
+            x_struct = torch.randn(target_len, 68)
         else:
             try:
                 with open(pose_path, 'rb') as f:
                     data = pickle.load(f)
                     if isinstance(data, np.ndarray):
                         data = torch.from_numpy(data).float()
-                        # 假设数据维度是 (T, J, C) -> (T, 17, 3)
-                        # 需要展平为 (T, 17*4) 或 (T, 68)
-                        T = data.shape[0]
+                        T = data.shape[0]  # 原始时间长度
                         x_struct = data.view(T, -1)
 
-                        # 时序归一化: Padding 或 Crop 到固定长度 50
-                        target_len = 50
+                        # Padding / Crop 到 target_len
                         if T < target_len:
                             pad = torch.zeros(target_len - T, x_struct.shape[1])
                             x_struct = torch.cat([x_struct, pad], dim=0)
                         else:
                             x_struct = x_struct[:target_len, :]
-                    else:
-                        x_struct = torch.randn(50, 68)
             except Exception as e:
-                # print(f"Error loading pose: {e}")
-                x_struct = torch.randn(50, 68)
+                x_struct = torch.randn(target_len, 68)
 
         # --- 2. 加载轮廓 (Visual Stream) ---
         if silu_path == 'dummy_silu':
-            x_vis = torch.randn(50, 768)
+            x_vis = torch.randn(target_len, 3, 224, 224)
         else:
+            # 实际读取序列图片 -> Resize -> ToTensor
             # 真实加载逻辑:
             # 这里原本应该读取图片序列 -> Resize -> ToTensor -> ViT 提取特征
             # 为了让代码现在能跑通，我们暂时模拟特征
             # 实际项目中，您可以在这里插入加载图片的逻辑
-            x_vis = torch.randn(50, 768)
-
+            x_vis = torch.randn(target_len, 3, 224, 224)  # 临时代码
+        # 保证长度和x_struct一致，便于后续送ViT。
+        x_vis = x_vis[:target_len]
         return x_vis, x_struct
 
 
@@ -219,11 +226,14 @@ class FewShotSampler:
                 final_cov.append(batch_covs[idx])
 
         # 返回 Tensor
-        return (torch.stack(final_vis),
-                torch.stack(final_struct),
-                torch.tensor(final_lbl),
-                torch.tensor(final_cov),
-                torch.rand(len(final_vis), 50))  # Phase weights (GPE 模拟输出)
+        # --- 原来的堆叠 ---
+        final_vis = torch.stack(final_vis)  # shape: (B, T, C, H, W)
+        final_struct = torch.stack(final_struct)  # (B, T, D)
+        phase_weights = torch.rand(final_vis.shape[0], final_vis.shape[1])  # (B, T)
+        final_lbl = torch.tensor(final_lbl)
+        final_cov = torch.tensor(final_cov)
+        # --- 返回 ---
+        return final_vis, final_struct, final_lbl, final_cov, phase_weights
 
 
 # --- 单元测试入口 ---

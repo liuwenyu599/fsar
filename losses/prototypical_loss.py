@@ -17,7 +17,7 @@ class PrototypicalLoss(nn.Module):
     def __init__(self):
         super(PrototypicalLoss, self).__init__()
 
-    def forward(self, support_features, query_features, n_way, k_shot):
+    def forward(self, support_features, query_features, labels_query,n_way, k_shot):
         """
         Args:
             support_features: (N_way * K_shot, D) - 支撑集特征，假设已按类别排序
@@ -62,12 +62,7 @@ class PrototypicalLoss(nn.Module):
         # 计算每个类别的查询样本数 Q
         n_query = query_features.size(0)
         q_query_per_class = n_query // n_way
-
-        # 生成标签序列: [0, 0, ..., 1, 1, ..., N-1, ..., N-1]
-        # 确保标签在同一个 device 上
-        target_labels = torch.arange(n_way, device=query_features.device).reshape(-1, 1)
-        target_labels = target_labels.repeat(1, q_query_per_class).reshape(-1)
-
+        target_labels = labels_query
         # CrossEntropyLoss 内部会自动做 LogSoftmax
         loss = F.cross_entropy(logits, target_labels)
 

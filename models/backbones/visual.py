@@ -9,7 +9,7 @@ class VisualBackbone(nn.Module):
     视觉流: EfficientViT / ViT + LoRA
     """
 
-    def __init__(self, model_name='vit_tiny_patch16_224', pretrained=True, lora_rank=4):
+    def __init__(self, model_name='vit_tiny_patch16_224', pretrained=False, lora_rank=4):
         super(VisualBackbone, self).__init__()
 
         # 1. 加载预训练 ViT (移除分类头 num_classes=0)
