@@ -1,0 +1,24 @@
+
+        # --- PAG-FSL 超参数配置 ---
+        system:
+          common_dim: 512              # 公共特征维度 D
+          num_covariates: 4            # 协变量类别数 (例如 4 种衣着)
+        
+        few_shot:
+          n_way: 5                     # N-way (每 Episode 类别数)
+          k_shot: 1                    # K-shot (支撑集样本数)
+          q_query: 15                  # 查询集样本数
+        
+        loss_weights:
+          lambda_disc: 0.01            # L_disc 权重 λ1 (极小值)
+          lambda_align: 0.5            # L_align 权重 λ2
+        
+        training:
+          epochs: 100
+          batch_size_per_episode: 4
+          learning_rate: 0.0001
+          stage_two_epoch: 20          # Stage I (L_proto only) 运行的 Epoch 数
+        
+        datasets:
+          casia_b_root: /datasets/CASIA-B
+        
