@@ -15,11 +15,11 @@ class PAGFSLModel(nn.Module):
     结构流: MotionBERT / 简化版
     特征融合: PPM + FAM
     """
-    def __init__(self, common_dim=512, input_struct=51, lora_rank=8):
+    def __init__(self, common_dim=512, input_struct=51, lora_rank=16):
         super().__init__()
 
         # --- 1. 视觉流骨干 ---
-        self.vis_backbone = VisualBackbone(lora_rank=lora_rank)
+        self.vis_backbone = VisualBackbone(lora_rank=lora_rank,pretrained=False)
         vis_out_dim = self.vis_backbone.out_dim
 
         # --- 2. 结构流骨干 ---

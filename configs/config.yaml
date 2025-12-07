@@ -5,7 +5,7 @@
 system:
   common_dim: 512              # 公共特征维度 D
   num_covariates: 4            # 协变量类别数 (例如 4 种衣着)
-
+  device: "cuda"               # 或 "cuda:0", "cuda:1", "cpu"
 # --- Few-Shot 任务配置 ---
 few_shot:
   n_way: 5                     # N-way
@@ -19,8 +19,8 @@ weights:
 
 # --- 训练参数 ---
 train:
-  lr: 0.0001
-  epochs: 50
+  lr: 0.001
+  epochs: 100
   batch_size_per_episode: 4    # 仅占位，实际由 Sampler 控制
 
 # --- 数据集路径 ---
