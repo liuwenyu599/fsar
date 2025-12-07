@@ -188,6 +188,6 @@ def train(config_path='configs/config.yaml'):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='configs/config.yaml')
+    parser.add_argument('--config', type=str, default='/home/lwy/projects/fsan/configs/config.yaml')
     args = parser.parse_args()
     train(args.config)

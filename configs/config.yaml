@@ -14,12 +14,12 @@ few_shot:
   batch_size: 64
 # --- 损失函数权重 ---
 weights:
-  lambda_disc: 0.01            # L_disc 权重
+  lambda_disc: 0.001            # L_disc 权重
   lambda_align: 0.5            # L_align 权重
 
 # --- 训练参数 ---
 train:
-  lr: 0.001
+  lr: 0.0001
   epochs: 100
   batch_size_per_episode: 4    # 仅占位，实际由 Sampler 控制
 
