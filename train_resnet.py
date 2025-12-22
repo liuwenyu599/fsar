@@ -3,15 +3,19 @@ import torch
 import torch.optim as optim
 import yaml
 import argparse
-from timm.utils import ModelEmaV2  # 🔥 引入 Model EMA 工具
+from timm.utils import ModelEmaV2
+import matplotlib.pyplot as plt
+import torch.optim.lr_scheduler as lr_scheduler  # 引入学习率调度器
 
-# 确保 models/architecture.py 存在且 PAGFSLModel 类定义正确
+# 确保 models/architecture_res.py 存在且 PAGFSLModel 类定义正确
 from models.architecture_res import PAGFSLModel
 from losses.prototypical_loss import PrototypicalLoss
 from dataloader.silu_resnet_loader import CASIASiluDataset, FewShotSampler
 
+
 def train(config_path='configs/config.yaml'):
-    print("--- 🚀 PAG-FSL Training Start (SimpleCNN + Model EMA) ---")
+    # 🔥🔥🔥 保持原有的打印信息不变 🔥🔥🔥
+    print("--- 🚀 PAG-FSL Training Start (Visual Stream Stabilized) ---")
 
     # ---------------------------
     # 1. 配置加载
@@ -21,7 +25,7 @@ def train(config_path='configs/config.yaml'):
     else:
         config = {
             'system': {'common_dim': 512, 'device': 'cuda'},
-            'train': {'lr': 1e-3, 'epochs': 100},
+            'train': {'lr': 1e-3, 'epochs': 200},  # 默认使用 200 步
             'few_shot': {'n_way': 5, 'k_shot': 5, 'q_query': 15, 'batch_size': 64}
         }
 
@@ -31,7 +35,6 @@ def train(config_path='configs/config.yaml'):
     # 2. 数据集 & 采样器
     # ---------------------------
     dataset = CASIASiluDataset('/datasets/CASIA-B/silu')
-    # 5-way 5-shot
     n_way, k_shot, q_query = 5, 5, 15
     sampler = FewShotSampler(dataset, n_way, k_shot, q_query)
 
@@ -40,37 +43,43 @@ def train(config_path='configs/config.yaml'):
     # ---------------------------
     model = PAGFSLModel(common_dim=config['system']['common_dim']).to(device)
     model.train()
-
-    # 全量解冻 (SimpleCNN 必需)
     for p in model.parameters():
         p.requires_grad = True
 
     # ---------------------------
     # 4. 初始化 EMA 模型 (Shadow Model)
     # ---------------------------
-    # decay=0.999 是标准值，意味着当前权重只占 0.1%，历史权重占 99.9%
-    # 这能极大平滑梯度的抖动
-    print("--- Initializing Model EMA (decay=0.999) ---")
-    model_ema = ModelEmaV2(model, decay=0.999, device=device)
+    print("--- Initializing Model EMA (decay=0.99) ---")
+    model_ema = ModelEmaV2(model, decay=0.99, device=device)
 
     # ---------------------------
-    # 5. 优化器 (强制 1e-3)
+    # 5. 优化器 & 调度器 (关键修正 🔥)
     # ---------------------------
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    epochs = 150  # 确保 scheduler T_max 与 epochs 一致
+
+    # 🔥 使用 AdamW，并加入 Weight Decay 正则化 🔥
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
     criterion_proto = PrototypicalLoss().to(device)
     scaler = torch.cuda.amp.GradScaler()
 
+    # 🔥 引入 CosineAnnealingLR 调度器 🔥
+    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+
     # ---------------------------
-    # 6. 训练循环
+    # 6. 训练循环 (含数据收集)
     # ---------------------------
-    epochs = 100
     batch_size_vit = 128
-
-    # 定义 Loss 平滑系数
     loss_ema_decay = 0.9
-    ema_loss_val = None  # 初始化平滑 Loss
+    ema_loss_val = None
 
-    print(f"Start training: {n_way}-way {k_shot}-shot...")
+    # 🔥 数据收集列表 🔥 (确保定义在循环外部)
+    epochs_list = []
+    loss_list = []
+    acc_list = []
+    ema_loss_list = []
+    ema_acc_list = []
+
+    print(f"Start training: {n_way}-way {k_shot}-shot, Total Epochs: {epochs}...")
 
     for epoch in range(1, epochs + 1):
         # A. 获取数据
@@ -103,7 +112,7 @@ def train(config_path='configs/config.yaml'):
         # E. 主模型 Loss & Acc
         loss, acc = criterion_proto(f_supp, f_query, labels_query, n_way, k_shot)
 
-        # --- 🔥 计算 Loss EMA (用于日志平滑) ---
+        # --- 计算 Loss EMA ---
         if ema_loss_val is None:
             ema_loss_val = loss.item()
         else:
@@ -118,21 +127,19 @@ def train(config_path='configs/config.yaml'):
         # G. 更新 Model EMA 权重
         model_ema.update(model)
 
-        # --- 🔥 验证 Model EMA 的性能 (额外跑一次前向，只为了看精度) ---
-        # 注意：这里我们用 EMA 模型再算一遍 Acc，看看是不是更稳
+        # H. 更新 Scheduler 权重 🔥
+        scheduler.step()
+
+        # --- 验证 Model EMA 的性能 ---
         with torch.no_grad():
             with torch.cuda.amp.autocast():
-                # 1. 提取特征 (使用 EMA 模型)
-                # ModelEmaV2 包装了 module，所以要用 model_ema.module 来调用
                 feats_ema = []
                 for i in range(0, total_BT, batch_size_vit):
                     chunk = X_flat[i:i + batch_size_vit]
-                    # 调用 shadow model
                     f_e = model_ema.module.vis_backbone(chunk)
                     p_e = model_ema.module.proj_vis(f_e)
                     feats_ema.append(p_e)
 
-                # 2. 聚合与计算
                 F_flat_ema = torch.cat(feats_ema, dim=0).float()
                 f_final_ema = F_flat_ema.reshape(B, T, -1).max(dim=1)[0]
 
@@ -140,29 +147,67 @@ def train(config_path='configs/config.yaml'):
                 f_supp_e = f_reshaped_e[:, :k_shot, :].contiguous().view(n_way * k_shot, -1)
                 f_query_e = f_reshaped_e[:, k_shot:, :].contiguous().view(n_way * q_query, -1)
 
-                # 计算 EMA 模型的 Acc (不需要算 loss，只看 acc)
                 _, acc_ema = criterion_proto(f_supp_e, f_query_e, labels_query, n_way, k_shot)
 
-        # 打印日志 (显示 Loss_EMA 和 Acc_EMA)
+        # 🔥 数据收集 🔥 (确保每个 epoch 都执行)
+        epochs_list.append(epoch)
+        loss_list.append(loss.item())
+        acc_list.append(acc.item())
+        ema_loss_list.append(ema_loss_val)
+        acc_ema_float = acc_ema.item()
+        ema_acc_list.append(acc_ema_float)
+
+        # 打印日志 (注意：日志格式保持不变)
         if epoch % 5 == 0:
+            current_lr = optimizer.param_groups[0]['lr']
             print(f"[Epoch {epoch}/{epochs}] "
                   f"Loss: {loss.item():.4f} (EMA: {ema_loss_val:.4f}) | "
-                  f"Acc: {acc:.4f} (EMA-Acc: {acc_ema:.4f})")
+                  f"Acc: {acc.item():.4f} (EMA-Acc: {acc_ema_float:.4f}) | LR: {current_lr:.6f}")
+
     # ---------------------------
     # 7. 保存模型 (保存两个版本)
     # ---------------------------
     save_dir = 'logs/checkpoints'
     os.makedirs(save_dir, exist_ok=True)
 
-    # 保存普通模型 (最新权重)
     torch.save(model.state_dict(), os.path.join(save_dir, 'pag_fsl_vis_latest.pth'))
-
-    # 🔥 保存 EMA 模型 (平滑权重，通常泛化更好)
-    # 注意要取 .module，因为 ModelEmaV2 包装了一层
     torch.save(model_ema.module.state_dict(), os.path.join(save_dir, 'pag_fsl_vis_ema.pth'))
 
     print("✅ Training finished. Saved 'latest' and 'ema' checkpoints.")
 
+    # ---------------------------
+    # 8. 可视化结果 🔥
+    # ---------------------------
+    plt.figure(figsize=(12, 5))
+
+    # 子图 1: Loss
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs_list, loss_list, label='Batch Loss', color='blue', alpha=0.6)
+    plt.plot(epochs_list, ema_loss_list, label='EMA Loss', color='red', linewidth=2)
+    plt.title('Training Loss over Epochs')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    # 子图 2: Accuracy
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs_list, acc_list, label='Batch Acc', color='blue', alpha=0.6)
+    plt.plot(epochs_list, ema_acc_list, label='EMA Acc', color='red', linewidth=2)
+    plt.title('Training Accuracy over Epochs')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plot_filename = os.path.join(save_dir, 'training_metrics_vis_stream.png')
+    plt.savefig(plot_filename)
+    print(f"✅ Training metrics saved to {plot_filename}")
+
 
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, default='configs/config.yaml')
+    args = parser.parse_args()
+    train(args.config)
