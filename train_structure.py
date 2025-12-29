@@ -99,7 +99,7 @@ def train():
 
     # A. 数据准备
     dataset = CASIABMultiDataset('/datasets/CASIA-B', mode='pose', seq_len=60)
-    train_sampler = FewShotSampler(dataset, n_way=5, k_shot=1, q_query=4)
+    train_sampler = FewShotSampler(dataset, n_way=5, k_shot=5, q_query=4)
 
     # B. 模型初始化 (自动探测维度)
     X_init, _, _, _ = train_sampler.get_episode(mode='train')

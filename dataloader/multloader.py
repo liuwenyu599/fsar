@@ -1,5 +1,10 @@
-import torch
+import sys
 import os
+
+# 将项目根目录加入到搜索路径中
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+import torch
+
 import random
 import numpy as np
 import pickle
