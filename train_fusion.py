@@ -1,191 +1,173 @@
-import torch
+import sys, os, torch, random, numpy as np
 import torch.nn as nn
-torch.cuda.empty_cache() # 强制清理之前的残留
 import torch.optim as optim
 import torch.nn.functional as F
-import os
-import numpy as np
-import random
-import datetime
+from tqdm import tqdm
+from torch.amp import autocast, GradScaler
 
-# 导入之前的架构
+# ---------------------------------------------------------
+# 1. 环境与组件
+# ---------------------------------------------------------
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 from models.backbones.structural import StructuralBackbone
-from models.heads.ppm import PPMStructuredAggregator
-from models.architecture_res import PAGFSLModel
-from losses.prototypical_loss import PrototypicalLoss
-from dataloader.multloader import CASIABMultiDataset as StructDataset
-from dataloader.silu_resnet_loader import CASIASiluDataset as VisDataset
+from models.backbones.lora_handler import inject_lora_to_motionbert
+from dataloader.multloader import CASIABMultiDataset as S_DS
+from dataloader.silu_resnet_loader import CASIASiluDataset as V_DS
+
+
+def unified_align_pose(pose_data):
+    if not isinstance(pose_data, torch.Tensor):
+        pose_data = torch.from_numpy(pose_data)
+    flat = pose_data.reshape(-1)
+    new_data = torch.zeros(3060)
+    new_data[:min(flat.shape[0], 3060)] = flat[:min(flat.shape[0], 3060)]
+    return new_data.view(60, 51).float()
+
+
+class VisualFeatureExtractor(nn.Module):
+    def __init__(self, dim=512, num_classes=125):
+        super().__init__()
+        from torchvision.models import resnet50, ResNet50_Weights
+        self.backbone = resnet50(weights=ResNet50_Weights.DEFAULT)
+        self.backbone.fc = nn.Identity()
+        self.proj = nn.Sequential(nn.Linear(2048, 1024), nn.ReLU(), nn.Linear(1024, dim))
+        self.classifier = nn.Linear(dim, num_classes)  # 用于视觉身份预热
+
+    def forward(self, x, return_logits=False):
+        B, T, C, H, W = x.shape
+        x = x.view(B * T, C, H, W)
+        feat = self.backbone(x)
+        feat = self.proj(feat).view(B, T, -1).mean(dim=1)
+        if return_logits:
+            return feat, self.classifier(feat)
+        return feat
+
+
+class BCAFusionLayer(nn.Module):
+    def __init__(self, dim=512):
+        super().__init__()
+        self.v2s_cross = nn.MultiheadAttention(dim, 8, batch_first=True)
+        self.s2v_cross = nn.MultiheadAttention(dim, 8, batch_first=True)
+        self.norm_v, self.norm_s = nn.LayerNorm(dim), nn.LayerNorm(dim)
+        self.gate = nn.Sequential(nn.Linear(dim * 2, 128), nn.ReLU(), nn.Linear(128, 2))
+        # 🌟 初始化：初始让 Alpha_S 偏小，避开 1.0 陷阱
+        nn.init.constant_(self.gate[2].bias, -1.0)
+
+    def forward(self, v_f, s_f):
+        v, s = v_f.view(-1, 512), s_f.view(-1, 512)
+        v_enh = self.norm_v(v + self.v2s_cross(v.unsqueeze(1), s.unsqueeze(1), s.unsqueeze(1))[0].squeeze(1))
+        s_enh = self.norm_s(s + self.s2v_cross(s.unsqueeze(1), v.unsqueeze(1), v.unsqueeze(1))[0].squeeze(1))
+        w = F.softmax(self.gate(torch.cat([v_enh, s_enh], dim=-1)), dim=-1)
+        return w[:, 0:1] * v_enh + w[:, 1:2] * s_enh, w[:, 1:2]
 
 
 # ---------------------------------------------------------
-# 1. 核心模块：保持“白板”状态的融合门控
-# ---------------------------------------------------------
-class UncertaintyFusionGate(nn.Module):
-    def __init__(self, feature_dim=512):
-        super(UncertaintyFusionGate, self).__init__()
-        self.gate = nn.Sequential(
-            nn.Linear(feature_dim * 2, 128),
-            nn.ReLU(),
-            nn.Linear(128, 1)
-        )
-        # 保持公平初始化：Sigmoid(0) = 0.5
-        nn.init.constant_(self.gate[2].weight, 0)
-        nn.init.constant_(self.gate[2].bias, 0)
-
-    def forward(self, f_struct, f_vis):
-        combined = torch.cat([f_struct, f_vis], dim=-1)
-        alpha = torch.sigmoid(self.gate(combined))
-        # 融合公式
-        f_fused = alpha * f_struct + (1 - alpha) * f_vis
-        return f_fused, alpha
-
-
-# ---------------------------------------------------------
-# 2. 熵损失计算 (用于鼓励模型探索)
-# ---------------------------------------------------------
-def compute_entropy_loss(alpha, epsilon=1e-6):
-    """
-    计算二元分布的熵：H(alpha) = -[a*log(a) + (1-a)*log(1-a)]
-    """
-    entropy = - (alpha * torch.log(alpha + epsilon) + (1 - alpha) * torch.log(1 - alpha + epsilon))
-    return entropy.mean()
-
-
-# ---------------------------------------------------------
-# 3. 融合训练逻辑
+# 2. 核心训练主程序
 # ---------------------------------------------------------
 def train_fusion():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print("--- 🏁 PPGait: Fusion Training with Entropy Regularization ---")
+    device = "cuda"
+    print("\n🔥 [Stage 3.0] 强迫参与训练模式：注入 Modal Dropout ...")
 
-    # A. 加载权重 (PyTorch 2.6 兼容)
-    struct_ckpt = torch.load('logs/checkpoints/ppgait_struct_best.pth', weights_only=False)
-    vis_ckpt = torch.load('logs/checkpoints/ppgait_vis_ema_best.pth', weights_only=False)
+    s_model = inject_lora_to_motionbert(StructuralBackbone(), rank=8).to(device)
+    v_model = VisualFeatureExtractor(512, num_classes=125).to(device)
+    fusion = BCAFusionLayer(512).to(device)
 
-    # B. 初始化单流模型并冻结
-    struct_model = StructuralBackbone(input_dim=struct_ckpt['config']['input_dim']).to(device)
-    struct_ppm = PPMStructuredAggregator(feature_dim=512).to(device)
-    struct_model.load_state_dict(struct_ckpt['backbone_state_dict'])
-    struct_ppm.load_state_dict(struct_ckpt['ppm_state_dict'])
+    # 尝试加载最新权重继续
+    ckpt_path = 'logs/checkpoints/ppgait_fusion_triplet_final.pth'
+    if os.path.exists(ckpt_path):
+        ckpt = torch.load(ckpt_path, map_location=device)
+        s_model.load_state_dict(ckpt['struct_lora_state_dict'], strict=False)
+        fusion.load_state_dict(ckpt['fusion_layer_state_dict'], strict=False)
+        if 'visual_state_dict' in ckpt:
+            v_model.load_state_dict(ckpt['visual_state_dict'], strict=False)
 
-    vis_all_model = PAGFSLModel(common_dim=512).to(device)
-    vis_all_model.load_state_dict(vis_ckpt['state_dict'])
+    # 梯度解冻：LoRA + Proj + Fusion
+    for name, p in s_model.named_parameters(): p.requires_grad = True if 'lora_' in name else False
+    for p in v_model.backbone.parameters(): p.requires_grad = False
+    for p in v_model.proj.parameters(): p.requires_grad = True
+    for p in fusion.parameters(): p.requires_grad = True
 
-    vis_backbone = vis_all_model.vis_backbone
-    vis_hpm = vis_all_model.hpm
-    vis_proj = vis_all_model.proj_vis
+    optimizer = optim.AdamW([
+        {'params': fusion.parameters(), 'lr': 2e-4},
+        {'params': v_model.proj.parameters(), 'lr': 2e-4},
+        {'params': [p for p in s_model.parameters() if p.requires_grad], 'lr': 2e-5}  # 略微调高 LoRA 学习率
+    ])
 
-    # 深度冻结
-    for p in [struct_model, struct_ppm, vis_backbone, vis_hpm, vis_proj]:
-        p.eval()
-        for param in p.parameters(): param.requires_grad = False
-    print(">>> Backbones Frozen. Starting adaptive exploration...")
+    criterion_tri = nn.TripletMarginLoss(margin=0.4)
+    criterion_cls = nn.CrossEntropyLoss()
+    scaler = GradScaler()
 
-    # C. 数据对齐准备
-    s_dataset = StructDataset('/datasets/CASIA-B', mode='pose')
-    v_dataset = VisDataset('/datasets/CASIA-B/silu', target_len=8)
-    n_way, k_shot, q_query = 5, 5, 4
-    target_views = ['090', '180', '054']
+    s_ds, v_ds = S_DS("/datasets/CASIA-B"), V_DS("/datasets/CASIA-B/silu", target_len=4)
+    train_ids = [sid for sid in s_ds.all_subject_ids if int(sid) <= 74]
 
-    # D. 初始化门控
-    fusion_gate = UncertaintyFusionGate(feature_dim=512).to(device)
-    optimizer = optim.AdamW(fusion_gate.parameters(), lr=0.0005)
-    criterion = PrototypicalLoss().to(device)
+    pbar = tqdm(range(1, 1001), desc="Forced Alignment")
+    for step in pbar:
+        # 🌟 健壮性采样
+        Xs, Xv, labels, raw_ids = [], [], [], []
+        while len(labels) < 8:
+            sid = random.choice(train_ids)
+            sid_str = str(sid).zfill(3)
+            try:
+                # 必须同时拥有 090 和 180
+                p_090 = [p for p in s_ds.all_sequences[sid_str] if 'nm-01' in p and '090' in p][0]
+                p_180 = [p for p in s_ds.all_sequences[sid_str] if 'nm-01' in p and '180' in p][0]
+                v_090 = v_ds.all_sequences[sid_str]['nm-01']['090']
+                v_180 = v_ds.all_sequences[sid_str]['nm-01']['180']
 
-    # E. 训练循环
-    total_steps = 1000
-    for step in range(1, total_steps + 1):
-        # 1. 同步采样
-        episode_view = random.choice(target_views)
-        common_ids = list(set(s_dataset.all_subject_ids) & set(v_dataset.all_subject_ids))
-        sampled_ids = random.sample(common_ids, n_way)
-        X_s_list, X_v_list = [], []
-        needed = k_shot + q_query
+                curr_label = len(raw_ids) // 2
+                for p_p, v_v in [(p_090, v_090), (p_180, v_180)]:
+                    Xs.append(unified_align_pose(s_ds.load_pose(p_p)))
+                    Xv.append(v_ds.load_sequence(v_v))
+                    labels.append(curr_label)
+                    raw_ids.append(int(sid) - 1)
+            except:
+                continue
 
-        for sid in sampled_ids:
-            s_paths = [p for p in s_dataset.all_sequences[sid] if episode_view in p]
-            v_seqs = v_dataset.all_sequences[sid]
-            v_paths = [v_seqs[c][episode_view] for c in v_seqs if episode_view in v_seqs[c]]
-            for _ in range(needed):
-                X_s_list.append(s_dataset.load_pose(random.choice(s_paths)))
-                X_v_list.append(v_dataset.load_sequence(random.choice(v_paths)))
+        Xs_t, Xv_t = torch.stack(Xs).to(device), torch.stack(Xv).to(device)
+        y_t, rid_t = torch.tensor(labels).to(device), torch.tensor(raw_ids).to(device)
 
-        X_s = torch.stack(X_s_list).view(n_way * needed, 60, -1).to(device)
-        X_v = torch.stack(X_v_list).to(device)
-
-        # 2. 提取特征
-        with torch.no_grad():
-            # A. 结构流特征 (计算开销小，保持原样)
-            f_s_raw = struct_ppm(struct_model(X_s), torch.ones(X_s.shape[0], 60).to(device))
-
-            # B. 视觉流特征 (🔥🔥🔥 显存优化版 🔥🔥🔥)
-            B_v, T_v, C_v, H_v, W_v = X_v.shape
-            x_v_flat = X_v.view(-1, C_v, H_v, W_v)
-
-            # --- 关键：将 B*T 个样本切分成小块处理 ---
-            micro_batch_size = 16  # 每次只送 16 张图进 ResNet
-            f_v_hpm_list = []
-
-            # 开启混合精度 autocast
-            with torch.amp.autocast('cuda'):
-                for i in range(0, x_v_flat.size(0), micro_batch_size):
-                    x_mini = x_v_flat[i: i + micro_batch_size]
-
-                    # 1. 提取卷积图
-                    f_maps = vis_backbone(x_mini)
-                    # 2. HPM 空间解耦 (这是显存消耗大户)
-                    f_hpm = vis_hpm(f_maps)
-
-                    # 转回 float32 并从显存缓存中分离，防止梯度图堆积
-                    f_v_hpm_list.append(f_hpm.float().cpu())  # 暂时存入内存
-
-            # 拼接并移回 GPU
-            f_v_hpm_all = torch.cat(f_v_hpm_list, dim=0).to(device)
-
-            # (3) 时序最大聚合
-            f_v_seq = f_v_hpm_all.view(B_v, T_v, -1)
-            f_v_pooled = f_v_seq.max(dim=1)[0]
-
-            # (4) 投影到公共空间 [B, 7680] -> [B, 512]
-            f_v_raw = vis_proj(f_v_pooled)
-
-        # 3. 归一化
-        f_s = F.normalize(f_s_raw, p=2, dim=-1)
-        f_v = F.normalize(f_v_raw, p=2, dim=-1)
-
-        # 4. 融合与计算 Loss
-        f_fused, alpha_vals = fusion_gate(f_s, f_v)
-
-        # (a) 基本原型损失
-        f_reshaped = f_fused.view(n_way, k_shot + q_query, -1)
-        f_supp = f_reshaped[:, :k_shot].contiguous().view(-1, 512)
-        f_query = f_reshaped[:, k_shot:].contiguous().view(-1, 512)
-        q_labels = torch.arange(n_way).repeat_interleave(q_query).to(device)
-        loss_proto, acc = criterion(f_supp, f_query, q_labels, n_way, k_shot)
-
-        # (b) 熵正则项 (物理约束 🔥)
-        # 前期设置较大的 lambda 鼓励探索，后期逐渐减小让其自由收敛
-        lambda_ent = 0.1 * (1 - step / total_steps)
-        loss_ent = compute_entropy_loss(alpha_vals)
-
-        # 我们的目标是最大化熵，所以是减去熵
-        total_loss = loss_proto - lambda_ent * loss_ent
-
-        # 5. 优化
         optimizer.zero_grad()
-        total_loss.backward()
-        optimizer.step()
+        with autocast(device_type='cuda'):
+            # 1. 视觉分支身份预热
+            feat_v, logits_v = v_model(Xv_t, return_logits=True)
+            l_cls = criterion_cls(logits_v, rid_t)
 
-        if step % 20 == 0:
-            avg_alpha = alpha_vals.mean().item()
-            print(f"[Step {step}] ProtoLoss: {loss_proto.item():.4f} | Acc: {acc.item():.4f} | "
-                  f"Avg Alpha: {avg_alpha:.4f} | Ent_Weight: {lambda_ent:.4f}")
+            # 2. 骨骼分支
+            sf = s_model(Xs_t).mean(dim=1)
+
+            # 🌟 [关键点] 模态丢弃：30% 概率关闭骨骼信号，强迫模型练视觉
+            if random.random() < 0.3:
+                sf = torch.zeros_like(sf)
+
+            # 3. 融合与 Triplet
+            ff, alpha = fusion(feat_v, sf)
+            ff = F.normalize(ff, dim=-1)
+
+            l_tri = 0
+            for k in range(0, len(ff), 2):
+                a, p = ff[k:k + 1], ff[k + 1:k + 2]
+                neg_indices = [idx for idx in range(len(ff)) if labels[idx] != labels[k]]
+                n = ff[random.choice(neg_indices):random.choice(neg_indices) + 1]
+                l_tri += criterion_tri(a, p, n)
+
+            loss = 1.0 * l_cls + 2.0 * (l_tri / (len(ff) / 2))
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        if step % 5 == 0:
+            pbar.set_postfix(
+                {"L_Cls": f"{l_cls.item():.2f}", "L_Tri": f"{l_tri.item():.2f}", "Alpha": f"{alpha.mean().item():.3f}"})
 
     # 保存
-    save_path = 'logs/checkpoints/ppgait_fusion_final.pth'
-    os.makedirs('logs/checkpoints', exist_ok=True)
-    torch.save({'gate_state_dict': fusion_gate.state_dict(), 'best_acc': acc.item()}, save_path)
-    print(f"✅ PPGait Fusion Complete. Saved to {save_path}")
+    torch.save({
+        'fusion_layer_state_dict': fusion.state_dict(),
+        'struct_lora_state_dict': {k: v for k, v in s_model.state_dict().items() if 'lora_' in k},
+        'visual_state_dict': v_model.state_dict()
+    }, 'logs/checkpoints/ppgait_fusion_triplet_final.pth')
 
 
 if __name__ == "__main__":

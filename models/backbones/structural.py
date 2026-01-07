@@ -1,39 +1,35 @@
 import torch
 import torch.nn as nn
+from .dstformer import DSTformer  # 确保文件名一致
 
 
 class StructuralBackbone(nn.Module):
-    """
-    结构流: MotionBERT Encoder (简化版实现)
-    实际项目中应加载 MotionBERT 预训练权重
-    """
-
-    def __init__(self, input_dim=68, embed_dim=512, depth=4, num_heads=8):
+    def __init__(self, embed_dim=256, dim_rep=512, depth=5, num_heads=8):
         super(StructuralBackbone, self).__init__()
 
-        # 1. 骨架嵌入层 (Input -> Feature)
-        self.embedding = nn.Linear(input_dim, embed_dim)
-
-        # 2. 位置编码 (简化为可学习参数)
-        self.pos_embed = nn.Parameter(torch.zeros(1, 100, embed_dim))  # 假设最大长度100
-
-        # 3. Transformer Encoder (模拟 MotionBERT 核心)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, batch_first=True)
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=depth)
-
-        self.out_dim = embed_dim
+        # 严格按照官方 YAML 和类定义参数实例化
+        self.encoder = DSTformer(
+            dim_in=3,  # (x, y, c)
+            dim_out=0,  # 设置为0以使 head 为 Identity
+            dim_feat=embed_dim,  # 256
+            dim_rep=dim_rep,  # 512
+            depth=depth,  # 5
+            num_heads=num_heads,  # 8
+            mlp_ratio=4,
+            num_joints=17,
+            maxlen=243,
+            att_fuse=True  # 官方双流融合逻辑
+        )
+        self.out_dim = dim_rep
 
     def forward(self, x):
-        # x: (B, T, Input_Dim) - 3D 骨架序列
+        # x: (B, T, 51) -> (B, F, J, C) 其中 F=T, J=17, C=3
         B, T, _ = x.shape
+        x = x.view(B, T, 17, 3)
 
-        # Embedding
-        x = self.embedding(x)
+        # 调用官方获取特征的方法，返回 [B, F, J, 512]
+        x = self.encoder.get_representation(x)
 
-        # Add Positional Encoding (Broadcasting)
-        x = x + self.pos_embed[:, :T, :]
-
-        # Transformer Forward
-        output = self.encoder(x)
-
-        return output  # (B, T, embed_dim)
+        # 在关节维度 (J) 做平均池化，保留时间维度用于后续 PPM 聚合
+        # 输出 [B, T, 512]
+        return x.mean(dim=2)
