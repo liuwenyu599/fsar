@@ -1,43 +1,35 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
-class PPMStructuredAggregator(nn.Module):
-    """
-    PPM (Physics-Prior Modeling) 模块
-    作用: 根据 GPE 生成的相位权重，对时序特征进行加权聚合。
-    """
+class ViewAwarePPM(nn.Module):
+    def __init__(self, feature_dim=512, num_views=11):
+        super().__init__()
+        # 🌟 核心：视角先验嵌入
+        self.view_embedding = nn.Embedding(num_views, 128)
 
-    def __init__(self, feature_dim):
-        super(PPMStructuredAggregator, self).__init__()
-        # 聚合后的特征精炼层 (Optional)
-        self.refiner = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim),
-            nn.LayerNorm(feature_dim),
-            nn.ReLU()
+        # 🌟 核心：视角门控网络，根据视角动态调节 512 个通道的权重
+        self.view_gate = nn.Sequential(
+            nn.Linear(128, 256),
+            nn.ReLU(),
+            nn.Linear(256, feature_dim),
+            nn.Sigmoid()
         )
+        self.feature_dim = feature_dim
 
-    def forward(self, motion_features, phase_weights):
+    def forward(self, x, phase_w, view_idx):
         """
-        Args:
-            motion_features: (B, T, D) - 骨架流特征序列
-            phase_weights: (B, T) - GPE 产生的权重 (支撑期权重高, 摆动期权重低)
-        Returns:
-            F_struct: (B, D) - 聚合后的鲁棒特征
+        x: [Batch, T, D]
+        view_idx: [Batch] - 采样器返回的视角索引
         """
-        # 1. 扩展权重维度: (B, T) -> (B, T, 1) -> (B, T, D)
-        weights_expanded = phase_weights.unsqueeze(-1)
+        # 1. 生成视角特定的特征掩码
+        v_emb = self.view_embedding(view_idx)  # [B, 128]
+        v_mask = self.view_gate(v_emb)  # [B, 512]
 
-        # 2. 加权求和
-        # 广播机制: weights 会自动复制到 D 维度
-        weighted_features = motion_features * weights_expanded
-        sum_features = weighted_features.sum(dim=1)  # (B, D)
+        # 2. 视角加权：在 180° 时自动抑制不稳定的关节点通道
+        x = x * v_mask.unsqueeze(1)
 
-        # 3. 归一化 (除以权重的和，相当于加权平均)
-        sum_weights = phase_weights.sum(dim=1).unsqueeze(-1) + 1e-6
-        F_struct_raw = sum_features / sum_weights
-
-        # 4. 精炼
-        F_struct = self.refiner(F_struct_raw)
-
-        return F_struct
+        # 3. 基础相位加权聚合
+        phase_w = F.softmax(phase_w, dim=1).unsqueeze(-1)
+        return torch.sum(x * phase_w, dim=1)

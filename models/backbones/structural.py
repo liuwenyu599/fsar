@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from .dstformer import DSTformer  # 确保文件名一致
+from models.backbones.dstformer import DSTformer  # 确保文件名一致
 
 
 class StructuralBackbone(nn.Module):
@@ -26,10 +26,12 @@ class StructuralBackbone(nn.Module):
         # x: (B, T, 51) -> (B, F, J, C) 其中 F=T, J=17, C=3
         B, T, _ = x.shape
         x = x.view(B, T, 17, 3)
-
+        # print(f"输入 DSTformer 之前的形状: {x.shape}")  # 预期: [B, 60, 17, 3]
         # 调用官方获取特征的方法，返回 [B, F, J, 512]
         x = self.encoder.get_representation(x)
-
+        # print(f"DSTformer 提取特征后的形状: {x.shape}")  # 预期: [B, 60, 17, 512]
         # 在关节维度 (J) 做平均池化，保留时间维度用于后续 PPM 聚合
         # 输出 [B, T, 512]
-        return x.mean(dim=2)
+        x_mean = x.mean(dim=2)
+        # print(f"关节点聚合后的形状: {x_mean.shape}")  # 预期: [B, 60, 512]
+        return x_mean

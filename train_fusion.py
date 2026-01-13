@@ -130,29 +130,42 @@ def train_fusion():
 
         optimizer.zero_grad()
         with autocast(device_type='cuda'):
-            # 1. 视觉分支身份预热
+            # 1. 视觉分支
             feat_v, logits_v = v_model(Xv_t, return_logits=True)
             l_cls = criterion_cls(logits_v, rid_t)
 
             # 2. 骨骼分支
-            sf = s_model(Xs_t).mean(dim=1)
+            sf_orig = s_model(Xs_t).mean(dim=1)  # 记录原始 sf 用于辅助监督
 
-            # 🌟 [关键点] 模态丢弃：30% 概率关闭骨骼信号，强迫模型练视觉
+            # --- 🌟 新增：单模态辅助监督 (在 Modal Dropout 之前) ---
+            sf_norm = F.normalize(sf_orig, dim=-1)
+            fv_norm = F.normalize(feat_v, dim=-1)
+
+            def compute_batch_triplet(features, labels_list):
+                l_tri_batch = 0
+                for k in range(0, len(features), 2):
+                    a, p = features[k:k + 1], features[k + 1:k + 2]
+                    neg_indices = [idx for idx in range(len(features)) if labels_list[idx] != labels_list[k]]
+                    n = features[random.choice(neg_indices):random.choice(neg_indices) + 1]
+                    l_tri_batch += criterion_tri(a, p, n)
+                return l_tri_batch / (len(features) / 2)
+
+            l_tri_s = compute_batch_triplet(sf_norm, labels)  # 强迫骨架学身份
+            l_tri_v = compute_batch_triplet(fv_norm, labels)  # 强迫视觉学身份
+
+            # 3. 模态丢弃 (仅影响融合流)
+            sf = sf_orig.clone()
             if random.random() < 0.3:
                 sf = torch.zeros_like(sf)
 
-            # 3. 融合与 Triplet
+            # 4. 融合
             ff, alpha = fusion(feat_v, sf)
-            ff = F.normalize(ff, dim=-1)
+            ff_norm = F.normalize(ff, dim=-1)
+            l_tri_f = compute_batch_triplet(ff_norm, labels)  # 融合后的主监督
 
-            l_tri = 0
-            for k in range(0, len(ff), 2):
-                a, p = ff[k:k + 1], ff[k + 1:k + 2]
-                neg_indices = [idx for idx in range(len(ff)) if labels[idx] != labels[k]]
-                n = ff[random.choice(neg_indices):random.choice(neg_indices) + 1]
-                l_tri += criterion_tri(a, p, n)
-
-            loss = 1.0 * l_cls + 2.0 * (l_tri / (len(ff) / 2))
+            # --- 🌟 总损失权重调整 ---
+            # 增加骨架 Triplet 的权重，平衡模态
+            loss = 1.0 * l_cls + 2.0 * l_tri_f + 1.5 * l_tri_s + 0.5 * l_tri_v
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)

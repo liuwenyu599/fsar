@@ -109,11 +109,15 @@ class CASIABMultiDataset(Dataset):
 
 
 class FewShotSampler:
-    def __init__(self, dataset, n_way, k_shot, q_query):
+    def __init__(self, dataset, n_way, k_shot, q_query, active_views=None):
         self.dataset, self.n_way, self.k_shot, self.q_query = dataset, n_way, k_shot, q_query
 
-        # 1. 建立视角索引 & 存为成员变量以修复 AttributeError
-        self.target_views = ['090', '180', '054']
+        # 1. 建立视角列表与映射表 (用于视角感知)
+        self.target_views = active_views if active_views is not None else \
+            ['000', '018', '036', '054', '072', '090', '108', '126', '144', '162', '180']
+
+        # 🌟 新增：视角字符串到索引的映射 (例如 '090' -> 3)
+        self.view_to_idx = {v: i for i, v in enumerate(self.target_views)}
         self.view_to_ids = {v: [] for v in self.target_views}
 
         for sid, paths in dataset.all_sequences.items():
@@ -134,27 +138,27 @@ class FewShotSampler:
 
         if not self.active_views:
             self.active_views = ['all']
-            print("⚠️ Warning: No specific views are healthy. Falling back to all-view mode.")
 
-        # 3. 划分训练/测试集
+        # 3. 划分数据集
         all_ids = sorted(dataset.all_subject_ids)
         random.seed(42)
         shuffled_ids = all_ids[:]
         random.shuffle(shuffled_ids)
-
         split = int(0.8 * len(shuffled_ids))
         self.train_ids_all = shuffled_ids[:split]
         self.test_ids_all = shuffled_ids[split:]
 
     def get_episode(self, mode="train"):
-        # 1. 选定本轮视角 (Episode-level Lock)
+        # 1. 选定本轮视角
         episode_view = random.choice(self.active_views)
         pool = self.train_ids_all if mode == "train" else self.test_ids_all
 
-        # 2. 确定候选人 (包含测试集借人逻辑防 nan)
+        # 2. 确定候选人
         candidates = [sid for sid in pool if sid in self.view_to_ids.get(episode_view, [])]
         if len(candidates) < self.n_way:
-            candidates = self.view_to_ids.get(episode_view, self.dataset.all_subject_ids)
+            candidates = self.view_to_ids.get(episode_view, [])
+        if len(candidates) < self.n_way:
+            candidates = pool
 
         sampled_ids = random.sample(candidates, self.n_way)
 
@@ -163,29 +167,28 @@ class FewShotSampler:
 
         for cls_idx, sid in enumerate(sampled_ids):
             all_paths = self.dataset.all_sequences.get(sid, [])
-            # 只取锁定视角的数据
-            if episode_view != 'all':
-                valid_paths = [p for p in all_paths if episode_view in p]
-            else:
-                valid_paths = all_paths
-
+            valid_paths = [p for p in all_paths if episode_view in p] if episode_view != 'all' else all_paths
             if not valid_paths: valid_paths = all_paths
 
             needed = self.k_shot + self.q_query
             selected = random.sample(valid_paths * (needed // len(valid_paths) + 1), needed)
 
             for pkl_path in selected:
-                # 统计各视角分布 (用于日志显示)
                 for v in self.target_views:
                     if v in pkl_path: view_stats[v] += 1
                 X.append(self.dataset.load_pose(pkl_path))
                 Y.append(cls_idx)
 
+        # 🌟 核心修复：生成视角索引 Tensor
+        # 找到当前 episode_view 在映射表中的索引，并扩展到每个样本
+        v_idx = self.view_to_idx.get(episode_view, 0)
+        v_idx_tensor = torch.full((len(X),), v_idx, dtype=torch.long)
+
         X = torch.stack(X)
-        X = X.view(X.shape[0], X.shape[1], -1)  # 展平为 [Batch, T, 51]
+        X = X.view(X.shape[0], X.shape[1], -1)  # [Batch, T, 51]
 
-        return X, torch.tensor(Y), torch.ones(X.shape[0], X.shape[1]), view_stats
-
+        # 🌟 返回 5 个值，匹配 train_structure.py 的解包要求
+        return X, torch.tensor(Y), torch.ones(X.shape[0], X.shape[1]), v_idx_tensor, view_stats
 if __name__ == "__main__":
     # 快速验证脚本
     ds = CASIABMultiDataset("/datasets/CASIA-B", mode="pose")
