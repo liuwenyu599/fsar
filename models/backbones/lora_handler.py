@@ -1,60 +1,44 @@
 import torch
 import torch.nn as nn
-import math
 
 
-class LoRALinear(nn.Module):
-    def __init__(self, original_layer, rank=8, lora_alpha=16):
+class PlainLoRALinear(nn.Module):
+    def __init__(self, base_layer, rank=16):
         super().__init__()
-        self.original_layer = original_layer
-        # 冻结原始层参数
-        for p in self.original_layer.parameters():
-            p.requires_grad = False
+        self.base_layer = base_layer
+        self.in_features = base_layer.in_features
+        self.out_features = base_layer.out_features
+        self.rank = rank
 
-        in_f, out_f = original_layer.in_features, original_layer.out_features
+        # 标准 LoRA 参数 (初始化在 CPU)
+        self.lora_A = nn.Parameter(torch.randn(self.in_features, rank))
+        self.lora_B = nn.Parameter(torch.zeros(rank, self.out_features))
 
-        # 🌟 优化：预对齐矩阵形状，避免 forward 中的转置操作
-        # A 矩阵负责降维，B 矩阵负责升维
-        self.lora_A = nn.Parameter(torch.zeros((in_f, rank)))
-        self.lora_B = nn.Parameter(torch.zeros((rank, out_f)))
-        self.scaling = lora_alpha / rank
+        nn.init.kaiming_uniform_(self.lora_A, a=5 ** 0.5)
 
-        # 初始化：A 采用 Kaiming，B 初始化为 0 保证初始输出为 0
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_B)
-
-    def forward(self, x):
-        # 🌟 优化：直接计算矩阵乘法，移除 .to(device) 同步操作
-        # x: [B, T, in_features]
-        lora_out = (x @ self.lora_A @ self.lora_B) * self.scaling
-        return self.original_layer(x) + lora_out
+    def forward(self, x, view_idx=None):  # 🌟 接收但忽略 view_idx，保持接口兼容
+        result = self.base_layer(x)
+        lora_path = x @ self.lora_A @ self.lora_B
+        return result + lora_path
 
 
-def inject_lora_to_motionbert(model, rank=8):
-    """递归替换 DSTformer 中的 Linear 层为 LoRA 版本"""
-    for param in model.parameters():
-        param.requires_grad = False
-
-    model_dict = dict(model.named_modules())
-    injected_count = 0
+def inject_view_lora(model, rank=16):
+    # 🌟 修复 Device 问题的关键：获取模型当前设备
+    device = next(model.parameters()).device
+    replaced_count = 0
 
     for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
-            # 针对官方 DSTformer 核心计算层的命名匹配
-            if any(target in name for target in ["qkv", "mlp_s.fc1", "mlp_t.fc1", "mlp_s.fc2", "mlp_t.fc2"]):
-                name_list = name.split('.')
-                parent_name = ".".join(name_list[:-1])
-                layer_name = name_list[-1]
-                parent = model_dict[parent_name]
+        if any(k in name for k in ["attn_s.qkv", "attn_t.qkv", "mlp_s.fc"]):
+            parent_name = ".".join(name.split(".")[:-1])
+            layer_name = name.split(".")[-1]
+            parent = dict(model.named_modules())[parent_name]
 
-                # 执行替换
-                setattr(parent, layer_name, LoRALinear(module, rank=rank))
-                injected_count += 1
+            old_layer = getattr(parent, layer_name)
+            # 🌟 创建新层并立即同步到 GPU
+            new_layer = PlainLoRALinear(old_layer, rank=rank).to(device)
 
-    # 仅开启 LoRA 参数的梯度
-    for n, p in model.named_parameters():
-        if "lora_" in n:
-            p.requires_grad = True
+            setattr(parent, layer_name, new_layer)
+            replaced_count += 1
 
-    print(f"✅ 官方 DSTformer LoRA 注入成功: 替换了 {injected_count} 个关键层")
+    print(f"🛡️ 对抗专用 LoRA 注入成功: 替换了 {replaced_count} 个关键层 (Device: {device})")
     return model
