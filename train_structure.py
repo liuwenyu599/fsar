@@ -1,27 +1,88 @@
-import torch
-import torch.optim as optim
+import os, sys, datetime, random, torch
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
-import os
-import datetime
-import random
-import numpy as np
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from torch.amp import autocast, GradScaler
 
 # 导入项目组件
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from models.backbones.structural import StructuralBackbone
-from models.backbones.lora_handler import inject_view_lora  # 确保是 PlainLoRA 版本
+from models.backbones.lora_handler import inject_view_lora
 from models.heads.view_discriminator import ViewDiscriminator
 from losses.prototypical_loss import PrototypicalLoss
 from dataloader.multloader import CASIABMultiDataset, FewShotSampler
 
-# 🌟 显存与计算优化
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# ---------------------------------------------------------
+# 1. 物理层：带时序采样的 Torso Unit Normalization
+# ---------------------------------------------------------
+def torso_unit_norm(pose, target_len=60):
+    """
+    pose: [T, 17, 3] or [T*51]
+    """
+    # 确保维度为 [T, 17, 3]
+    if pose.dim() == 1:
+        pose = pose.reshape(-1, 17, 3)
+    elif pose.dim() == 2:
+        pose = pose.reshape(-1, 17, 3)
+
+    curr_len = pose.shape[0]
+
+    # 🌟 时序对齐逻辑：确保输出固定为 target_len 帧
+    #
+    if curr_len > target_len:
+        # 随机裁剪
+        start = random.randint(0, curr_len - target_len)
+        pose = pose[start:start + target_len]
+    elif curr_len < target_len:
+        # 循环补齐
+        indices = np.arange(curr_len)
+        pad_indices = np.random.choice(indices, target_len - curr_len)
+        indices = np.sort(np.concatenate([indices, pad_indices]))
+        pose = pose[indices]
+
+    p = pose.clone().float()
+
+    # 物理归一化 (以腰部为原点)
+    hip_center = (p[:, 11:12, :2] + p[:, 12:13, :2]) / 2.0
+    p[:, :, :2] -= hip_center
+
+    # 尺度归一化 (躯干高度)
+    neck_center = (p[:, 5:6, :2] + p[:, 6:7, :2]) / 2.0
+    torso_h = torch.norm(neck_center - hip_center, dim=-1, keepdim=True).mean()
+    p[:, :, :2] /= (torso_h + 1e-6)
+
+    return p.reshape(target_len, 51)  # 最终输出固定 [60, 51]
 
 
-# --- 1. 结构流聚合器 ---
+# ---------------------------------------------------------
+# 2. 核心加载逻辑：解决 Pickle 和 维度报错
+# ---------------------------------------------------------
+def safe_load_pose(path):
+    try:
+        if path.endswith('.pth'):
+            data = torch.load(path, map_location='cpu')
+        else:
+            data = np.load(path, allow_pickle=True)
+            if data.dtype == 'O' and data.shape == ():
+                data = data.item()
+
+        if not isinstance(data, torch.Tensor):
+            data = torch.from_numpy(data)
+
+        # 🌟 修复关键：现在支持任意长度的输入，自动采样为 60 帧
+        return torso_unit_norm(data, target_len=60)
+    except Exception as e:
+        # 打印详细错误以便排查
+        # print(f"加载失败: {path} | 错误: {e}")
+        return torch.zeros(60, 51)
+
+
+# ---------------------------------------------------------
+# 3. 结构定义 (PPM)
+# ---------------------------------------------------------
 class StructuralPPM(nn.Module):
     def __init__(self, feature_dim=512):
         super().__init__()
@@ -32,62 +93,22 @@ class StructuralPPM(nn.Module):
         return torch.sum(x * phase_w, dim=1)
 
 
-# --- 2. 采样器 (与之前保持一致) ---
-class FewShotSamplerV2(FewShotSampler):
-    def __init__(self, dataset, n_way, k_shot, q_query, active_views=None):
-        self.dataset, self.n_way, self.k_shot, self.q_query = dataset, n_way, k_shot, q_query
-        self.target_views = active_views if active_views is not None else \
-            ['000', '018', '036', '054', '072', '090', '108', '126', '144', '162', '180']
-        self.view_to_idx = {v: i for i, v in enumerate(self.target_views)}
-        self.view_to_ids = {v: [] for v in self.target_views}
-        for sid, paths in dataset.all_sequences.items():
-            for v in self.target_views:
-                if any(v in p for p in paths): self.view_to_ids[v].append(sid)
-        self.active_views = [v for v in self.target_views if len(self.view_to_ids[v]) >= n_way]
-        all_ids = sorted(dataset.all_subject_ids)
-        random.seed(42)
-        shuffled_ids = all_ids[:]
-        random.shuffle(shuffled_ids)
-        split = int(0.8 * len(shuffled_ids))
-        self.train_ids_all, self.test_ids_all = shuffled_ids[:split], shuffled_ids[split:]
-
-    def get_episode(self, mode="train"):
-        episode_view = random.choice(self.active_views)
-        pool = self.train_ids_all if mode == "train" else self.test_ids_all
-        candidates = [sid for sid in pool if sid in self.view_to_ids.get(episode_view, [])]
-        if len(candidates) < self.n_way: candidates = pool
-        sampled_ids = random.sample(candidates, self.n_way)
-        X, Y = [], []
-        for cls_idx, sid in enumerate(sampled_ids):
-            all_paths = self.dataset.all_sequences.get(sid, [])
-            valid_paths = [p for p in all_paths if episode_view in p] or all_paths
-            selected = random.sample(valid_paths * 5, self.k_shot + self.q_query)
-            for pkl_path in selected:
-                X.append(self.dataset.load_pose(pkl_path))
-                Y.append(cls_idx)
-        v_idx = self.view_to_idx.get(episode_view, 0)
-        v_idx_tensor = torch.full((len(X),), v_idx, dtype=torch.long)
-        X = torch.stack(X).view(len(X), 60, -1)
-        return X, torch.tensor(Y), torch.ones(X.shape[0], X.shape[1]), v_idx_tensor
-
-
-# --- 3. 训练主程序 ---
+# ---------------------------------------------------------
+# 4. 训练主程序
+# ---------------------------------------------------------
 def train():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print("\n" + "=" * 50 + "\n🛡️ Stage 2: View-Adversarial(Anti-Collapse)\n" + "=" * 50)
+    print("\n" + "=" * 60 + "\n🛡️ Stage 2 V3: Live-LoRA & Physical Alignment\n" + "=" * 60)
 
     dataset = CASIABMultiDataset('/datasets/CASIA-B', mode='pose', seq_len=60)
-    train_sampler = FewShotSamplerV2(dataset, n_way=5, k_shot=5, q_query=5)
+    dataset.load_pose = safe_load_pose
+    sampler = FewShotSampler(dataset, n_way=5, k_shot=5, q_query=5)
 
     model = StructuralBackbone().to(device)
     model = inject_view_lora(model, rank=16)
-    model.to(device)
+    ppm = StructuralPPM(feature_dim=512).to(device)
+    discriminator = ViewDiscriminator(feature_dim=512, num_views=11).to(device)
 
-    backbone_dim = 512
-    ppm = StructuralPPM(feature_dim=backbone_dim).to(device)
-    discriminator = ViewDiscriminator(feature_dim=backbone_dim, num_views=11).to(device)
-
-    # 🌟 优化器：分层学习率
     optimizer = torch.optim.AdamW([
         {'params': model.parameters(), 'lr': 1e-4},
         {'params': ppm.parameters(), 'lr': 1e-4},
@@ -100,42 +121,39 @@ def train():
     criterion_view = nn.CrossEntropyLoss().to(device)
 
     writer = SummaryWriter(
-        os.path.join("logs", "tensorboard", "adv_" + datetime.datetime.now().strftime("%m%d-%H%M")))
+        os.path.join("logs", "tensorboard", "V3_S2_" + datetime.datetime.now().strftime("%m%d-%H%M")))
 
-    # 🌟 对抗配置
-    warmup_steps = 800  # 前 800 步专注 ID 学习，不进行对抗
-    temperature = 16.0  # 强制特征尺度，防止 Softmax 饱和导致的 Loss 锁死
+    best_acc = 0.0
+    temp = 16.0
+    warmup = 500
 
     for step in range(1, 3001):
-        X, Y, W, v_idx = train_sampler.get_episode(mode='train')
+        model.train();
+        ppm.train();
+        discriminator.train()
+
+        # 🌟 修复变量解包报错：使用 *args 接收所有返回值，只取前 4 个
+        batch_data = sampler.get_episode(mode='train')
+        X, Y, W, v_idx = batch_data[0], batch_data[1], batch_data[2], batch_data[3]
+
         X, Y, W, v_idx = X.to(device), Y.to(device), W.to(device), v_idx.to(device)
 
-        # 🌟 计算动态 Alpha (含 Warm-up 逻辑)
-        if step <= warmup_steps:
-            alpha = 0.0
-        else:
-            # 在 warmup 结束后，alpha 在 1000 步内从 0 线性增加到 1.0
-            alpha = min(1.0, (step - warmup_steps) / 1000.0)
+        alpha = min(1.0, (step - warmup) / 1000.0) if step > warmup else 0.0
 
         optimizer.zero_grad()
         with autocast(device_type='cuda'):
-            # 1. 提取特征并强制特征尺度
-            # F.normalize 后的向量长度为 1，乘以 temperature 确保度量空间有足够的“压力”
-            feat_seq = F.normalize(model(X, view_idx=None), p=2, dim=-1) * temperature
+            feat_seq = F.normalize(model(X, view_idx=v_idx), p=2, dim=-1) * temp
             f_final = ppm(feat_seq, W)
 
-            # 2. 身份识别 (ID) 分支
-            n, k, q = train_sampler.n_way, train_sampler.k_shot, train_sampler.q_query
+            n, k, q = 5, 5, 5
             f_r = f_final.view(n, k + q, -1)
             q_labels = torch.arange(n).repeat_interleave(q).to(device)
-            loss_id, acc = criterion_id(f_r[:, :k].reshape(-1, backbone_dim),
-                                        f_r[:, k:].reshape(-1, backbone_dim), q_labels, n, k)
+            loss_id, train_acc = criterion_id(f_r[:, :k].reshape(-1, 512),
+                                              f_r[:, k:].reshape(-1, 512), q_labels, n, k)
 
-            # 3. 对抗 (View) 分支
             view_pred = discriminator(f_final, alpha=alpha)
             loss_view = criterion_view(view_pred, v_idx)
 
-            # 🌟 总损失：alpha 控制对抗强度的介入
             total_loss = loss_id + alpha * loss_view
 
         scaler.scale(total_loss).backward()
@@ -145,19 +163,43 @@ def train():
 
         if step % 20 == 0:
             print(
-                f"[Step {step}/3000] L_ID: {loss_id.item():.3f} | L_View: {loss_view.item():.3f} | Acc: {acc.item():.4f} | Alpha: {alpha:.3f}")
-            writer.add_scalar('Train/Loss_ID', loss_id.item(), step)
-            writer.add_scalar('Train/Loss_View', loss_view.item(), step)
-            writer.add_scalar('Train/Acc', acc.item(), step)
+                f"[Step {step}] L_ID: {loss_id.item():.3f} | L_View: {loss_view.item():.3f} | Acc: {train_acc.item():.4f}")
+            writer.add_scalar('Train/Acc', train_acc.item(), step)
 
-        if step % 500 == 0:
-            torch.save({
-                'struct_backbone': model.state_dict(),
-                'ppm_state_dict': ppm.state_dict(),
-                'best_acc': acc.item()
-            }, f'logs/checkpoints/ppgait_adv_0118_s{step}.pth')
+        if step % 200 == 0:
+            # 同样应用解包修复逻辑 (在 validate 内部也需要注意)
+            val_acc = validate(model, ppm, sampler, device, temp)
+            print(f"🌈 Step {step} Validation Acc: {val_acc:.2f}%")
+            if val_acc > best_acc:
+                best_acc = val_acc
+                torch.save({'struct_backbone': model.state_dict(), 'ppm_state_dict': ppm.state_dict()},
+                           'logs/checkpoints/ppgait_v3_best.pth')
 
     writer.close()
+
+
+def validate(model, ppm, sampler, device, temp):
+    model.eval();
+    ppm.eval()
+    accs = []
+    for _ in range(50):
+        # 🌟 同样的解包修复
+        batch_data = sampler.get_episode(mode='test')
+        X, Y, W, v_idx = batch_data[0], batch_data[1], batch_data[2], batch_data[3]
+
+        X, Y, W, v_idx = X.to(device), Y.to(device), W.to(device), v_idx.to(device)
+        with torch.no_grad():
+            feat_seq = F.normalize(model(X, view_idx=v_idx), p=2, dim=-1) * temp
+            f_final = ppm(feat_seq, W)
+            n, k, q = 5, 5, 5
+            f_r = f_final.view(n, k + q, -1)
+            prototypes = f_r[:, :k].mean(dim=1)
+            queries = f_r[:, k:].reshape(n * q, -1)
+            dists = torch.cdist(queries, prototypes)
+            pred = dists.argmin(dim=1)
+            target = torch.arange(n).repeat_interleave(q).to(device)
+            accs.append((pred == target).float().mean().item())
+    return np.mean(accs) * 100
 
 
 if __name__ == '__main__':

@@ -2,174 +2,126 @@ import os
 import torch
 import torch.optim as optim
 import yaml
-import argparse
-import datetime
+import numpy as np
 from timm.utils import ModelEmaV2
-import matplotlib.pyplot as plt
-import torch.optim.lr_scheduler as lr_scheduler
 
-# 确保路径正确
+# 🌟 必须在 import plt 之前，解决 SSH 服务器无图形界面报错
+import matplotlib
+
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+import torch.optim.lr_scheduler as lr_scheduler
 from models.architecture_res import PAGFSLModel
 from losses.prototypical_loss import PrototypicalLoss
 from dataloader.silu_resnet_loader import CASIASiluDataset, FewShotSampler
 
+# 视角名称映射字典 (CASIA-B 标准)
+VIEW_MAP = {
+    '000': 0, '018': 1, '036': 2, '054': 3, '072': 4,
+    '090': 5, '108': 6, '126': 7, '144': 8, '162': 9, '180': 10
+}
 
-def train(config_path='configs/config.yaml'):
-    print("--- 🚀 PPGait Visual Stream Training (HPM + Memory Optimized) ---")
 
-    # 1. 配置加载
-    if os.path.exists(config_path):
-        config = yaml.safe_load(open(config_path))
-    else:
-        config = {
-            'system': {'common_dim': 512, 'device': 'cuda'},
-            'train': {'lr': 1e-4, 'epochs': 150},  # HPM 建议使用稍低的学习率
-            'few_shot': {'n_way': 5, 'k_shot': 5, 'q_query': 15}
-        }
+def train():
+    print("\n" + "=" * 60 + "\n🚀 PPGait Stage 1: Silhouette Training (Physical-Aligned)\n" + "=" * 60)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    common_dim, n_way, k_shot, q_query = 512, 5, 5, 15
 
-    # 2. 数据集 & 采样器
+    # 1. 数据准备
     dataset = CASIASiluDataset('/datasets/CASIA-B/silu', target_len=8)
-    n_way, k_shot, q_query = config['few_shot']['n_way'], config['few_shot']['k_shot'], config['few_shot']['q_query']
     sampler = FewShotSampler(dataset, n_way, k_shot, q_query)
 
-    # 3. 初始化模型 (PAGFSLModel 内部已集成 HPM 和取消池化的 VisualBackbone)
-    model = PAGFSLModel(common_dim=config['system']['common_dim']).to(device)
+    # 2. 模型初始化
+    model = PAGFSLModel(common_dim=common_dim).to(device)
     model.train()
-
-    # 4. 初始化 Model EMA
-    print("--- Initializing Model EMA (decay=0.99) ---")
     model_ema = ModelEmaV2(model, decay=0.99, device=device)
 
-    # 5. 优化器、Loss 和 调度器
-    epochs = config['train']['epochs']
-    # 针对 HPM 高维特征，建议稍微增加 weight_decay
-    optimizer = optim.AdamW(model.parameters(), lr=config['train']['lr'], weight_decay=5e-4)
+    # 3. 优化器
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=5e-4)
     criterion_proto = PrototypicalLoss().to(device)
-
     scaler = torch.amp.GradScaler('cuda')
-    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
 
-    # 6. 推理参数设置
-    # 🔥 核心修正：分批大小，防止 HPM 膨胀导致爆显存
-    batch_size_vit = 32
+    # --- 启动前预检 ---
+    print("🛡️  Running Pre-flight Check...")
+    batch_data = sampler.get_episode(mode='train')
+    v_raw = batch_data[3]
+    if isinstance(v_raw, dict):
+        v_name = list(v_raw.keys())[0]
+        if v_name not in VIEW_MAP:
+            print(f"⚠️ 警告: 采样器视角 {v_name} 不在映射表中，请检查！")
+    print("✅ Pre-flight Check Passed. Starting Loop.")
 
-    # 数据记录
-    epochs_list, loss_list, acc_list, ema_acc_list = [], [], [], []
-    loss_ema_decay = 0.9
-    ema_loss_val = None
-    best_ema_acc = 0.0
+    best_acc = 0.0
+    history = {'loss': [], 'acc': []}
 
-    print(f"Start training: {n_way}-way {k_shot}-shot, Total Epochs: {epochs}...")
+    for epoch in range(1, 101):
+        # A. 数据解包与视角映射
+        batch_data = sampler.get_episode(mode='train')
+        X_vis = batch_data[0].to(device)
+        phase_W = batch_data[2].to(device)
 
-    for epoch in range(1, epochs + 1):
-        # A. 获取数据
-        # X_vis: (B, T, C, H, W)
-        X_vis, _, _, view_stats = sampler.get_episode(mode='train')
-        B, T = X_vis.shape[0], X_vis.shape[1]
+        # 🌟 映射字典处理
+        v_data = batch_data[3]
+        v_name = list(v_data.keys())[0] if isinstance(v_data, dict) else '090'
+        v_idx = torch.full((X_vis.shape[0],), VIEW_MAP.get(v_name, 5), dtype=torch.long).to(device)
 
-        # 构造模拟的结构流输入 (由于此时只练视觉流，我们传零向量给结构分支)
-        X_struct_dummy = torch.zeros(B, T, 51).to(device)
-        phase_w_dummy = torch.ones(B, T).to(device)
+        # 结构流 Dummy 输入 (练视觉流时保持为0)
+        X_struct_zero = torch.zeros(X_vis.shape[0], X_vis.shape[1], 51).to(device)
 
-        # B. 训练前向传播 (利用 architecture_res.py 中的 forward_feature)
+        # B. 训练前向
         optimizer.zero_grad()
-
-        # 使用混合精度
         with torch.amp.autocast('cuda'):
-            # 🔥 我们只关心视觉流特征 f_vis
+            # 🌟 修正：传递 view_idx
             _, f_vis, _ = model.forward_feature(
-                X_vis.to(device),
-                X_struct_dummy,
-                phase_w_dummy,
-                batch_size=batch_size_vit
+                X_vis, X_struct_zero, phase_W,
+                batch_size=32, view_idx=v_idx
             )
 
-            # 准备原型网络输入 (f_vis 已经是 [B, 512])
-            f_reshaped = f_vis.view(n_way, k_shot + q_query, -1)
-            f_supp = f_reshaped[:, :k_shot].contiguous().view(n_way * k_shot, -1)
-            f_query = f_reshaped[:, k_shot:].contiguous().view(n_way * q_query, -1)
-            labels_query = torch.arange(n_way).repeat_interleave(q_query).to(device)
+            # 原型网络计算
+            f_re = f_vis.view(n_way, k_shot + q_query, -1)
+            f_s = f_re[:, :k_shot].contiguous().view(n_way * k_shot, -1)
+            f_q = f_re[:, k_shot:].contiguous().view(n_way * q_query, -1)
+            labels = torch.arange(n_way).repeat_interleave(q_query).to(device)
 
-            loss, acc = criterion_proto(f_supp, f_query, labels_query, n_way, k_shot)
+            loss, acc = criterion_proto(f_s, f_q, labels, n_way, k_shot)
 
-        # C. 反向传播与更新
+        # C. 更新权重
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()
         model_ema.update(model)
 
-        # D. EMA 性能评估 (同样采用分批推理，避免显存溢出)
-        with torch.no_grad():
-            with torch.amp.autocast('cuda'):
-                # 注意：model_ema.module 调用 forward_feature
-                _, f_vis_ema, _ = model_ema.module.forward_feature(
-                    X_vis.to(device),
-                    X_struct_dummy,
-                    phase_w_dummy,
-                    batch_size=batch_size_vit
-                )
+        # D. 保存与打印
+        history['loss'].append(loss.item())
+        history['acc'].append(acc.item())
 
-                f_reshaped_e = f_vis_ema.view(n_way, k_shot + q_query, -1)
-                f_supp_e = f_reshaped_e[:, :k_shot].contiguous().view(n_way * k_shot, -1)
-                f_query_e = f_reshaped_e[:, k_shot:].contiguous().view(n_way * q_query, -1)
-
-                _, acc_ema = criterion_proto(f_supp_e, f_query_e, labels_query, n_way, k_shot)
-
-        # E. 日志统计
-        curr_ema_acc = acc_ema.item()
-        if ema_loss_val is None:
-            ema_loss_val = loss.item()
-        else:
-            ema_loss_val = loss_ema_decay * ema_loss_val + (1 - loss_ema_decay) * loss.item()
-
-        epochs_list.append(epoch)
-        loss_list.append(loss.item())
-        acc_list.append(acc.item())
-        ema_acc_list.append(curr_ema_acc)
-
-        # F. 最优模型保存
-        save_dir = 'logs/checkpoints'
-        os.makedirs(save_dir, exist_ok=True)
-
-        if curr_ema_acc > best_ema_acc:
-            best_ema_acc = curr_ema_acc
-            checkpoint = {
-                'model_type': 'visual_stream_hpm',
-                'best_acc_ema': best_ema_acc,
-                'epoch': epoch,
-                'episode_config': {'n_way': n_way, 'k_shot': k_shot, 'q_query': q_query},
-                'view_config': {'target_views': sampler.target_views, 'view_lock': True},
-                'state_dict': model_ema.module.state_dict(),
-                'timestamp': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
-            torch.save(checkpoint, os.path.join(save_dir, 'ppgait_vis_ema_best.pth'))
-            print(f"   >>> 💾 [Best Updated] EMA Acc: {best_ema_acc:.4f}")
+        if acc.item() > best_acc:
+            best_acc = acc.item()
+            torch.save(model_ema.module.state_dict(), 'logs/checkpoints/ppgait_vis_best.pth')
+            print(f"   >>> 💾 Best Updated: {best_acc:.4f} (View: {v_name})")
 
         if epoch % 5 == 0:
-            current_lr = optimizer.param_groups[0]['lr']
-            view_str = ", ".join([f"{k}:{v}" for k, v in view_stats.items() if v > 0])
-            print(f"[Epoch {epoch}/{epochs}] Loss: {loss.item():.4f} | Acc: {acc.item():.4f} "
-                  f"| EMA-Acc: {curr_ema_acc:.4f} | LR: {current_lr:.6f} | View: {view_str}")
+            print(f"[Epoch {epoch}] Loss: {loss.item():.4f} | Batch-Acc: {acc.item():.4f}")
 
-    # 7. 最终保存
-    torch.save(model.state_dict(), os.path.join(save_dir, 'ppgait_vis_latest.pth'))
-    print(f"✅ Training finished. Best EMA Acc: {best_ema_acc:.4f}")
+    # E. 结果绘图
+    _plot_save(history)
+    print(f"✅ Finished. Best Accuracy: {best_acc:.4f}")
 
-    # 8. 绘制曲线
-    plt.figure(figsize=(12, 5))
-    plt.subplot(1, 2, 1)
-    plt.plot(epochs_list, loss_list, label='Train Loss');
-    plt.title('Loss Curve');
-    plt.legend()
-    plt.subplot(1, 2, 2)
-    plt.plot(epochs_list, acc_list, label='Batch Acc', alpha=0.3)
-    plt.plot(epochs_list, ema_acc_list, label='EMA Acc', color='red')
-    plt.title('Accuracy Curve');
-    plt.legend()
-    plt.savefig(os.path.join(save_dir, 'training_metrics_vis_stream_hpm.png'))
+
+def _plot_save(history):
+    plt.figure(figsize=(10, 4))
+    plt.subplot(1, 2, 1);
+    plt.plot(history['loss']);
+    plt.title('Training Loss')
+    plt.subplot(1, 2, 2);
+    plt.plot(history['acc'], color='red');
+    plt.title('Batch Accuracy')
+    plt.savefig('logs/checkpoints/vis_train_summary.png')
+    plt.close()
 
 
 if __name__ == "__main__":
