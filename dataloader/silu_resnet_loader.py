@@ -1,184 +1,171 @@
 import os
 import torch
-import random
-import numpy as np
 import cv2
+import numpy as np
 import pickle
+import random
 from torch.utils.data import Dataset
+from torchvision import transforms
 
 
-class CASIASiluDataset:
-    def __init__(self, silu_root, target_len=8):
-        self.silu_root = silu_root
+def align_silhouette(img, target_size=(224, 224)):
+    """
+    步态剪影重心对齐标准化 (Centroid Alignment)
+    """
+    # 找到所有非零像素
+    ys, xs = np.where(img > 0)
+    if len(xs) == 0:
+        return np.zeros(target_size, dtype=np.uint8)
+
+    # 1. 提取人体边界
+    y_min, y_max = np.min(ys), np.max(ys)
+    x_min, x_max = np.min(xs), np.max(xs)
+
+    # 2. 计算横向重心 (Centroid) - 比取中点更稳健
+    x_center = int(np.mean(xs))
+
+    # 3. 裁剪人体
+    body = img[y_min:y_max, x_min:x_max]
+
+    # 4. 保持比例缩放
+    h_target, w_target = target_size
+    ratio = h_target / (y_max - y_min + 1e-6)
+    new_w = int((x_max - x_min) * ratio)
+    new_w = min(new_w, w_target)
+
+    body_resized = cv2.resize(body, (new_w, h_target))
+
+    # 5. 画布居中对齐
+    aligned_img = np.zeros(target_size, dtype=np.uint8)
+    start_x = w_target // 2 - new_w // 2
+    aligned_img[:, start_x:start_x + new_w] = body_resized
+
+    return aligned_img
+
+
+class CASIASiluDataset(Dataset):
+    def __init__(self, data_root, target_len=16, img_size=(224, 224)):
+        self.data_root = data_root
         self.target_len = target_len
-        print(f"[CASIA-SILU] Loading from: {silu_root}")
+        self.img_size = img_size
+        self.subjects = sorted([d for d in os.listdir(data_root) if os.path.isdir(os.path.join(data_root, d))])
 
-        # 扫描数据并建立结构化字典
-        self.all_sequences = self._scan_silu()
-        self.all_subject_ids = sorted(list(self.all_sequences.keys()))
-        print(f"[CASIA-SILU] Found {len(self.all_subject_ids)} subjects.")
+        # 索引格式: {sub_id: {view: [pkl_paths]}}
+        self.index = self._build_index()
 
-    def _scan_silu(self):
-        data = {}
-        if not os.path.exists(self.silu_root):
-            return data
+        # 标准化：针对 ResNet 预训练权重
+        self.transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Lambda(lambda x: x.convert("RGB")),
+            transforms.RandomHorizontalFlip(p=0.5),  # 模拟镜像视角增强
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
 
-        for sid in sorted(os.listdir(self.silu_root)):
-            sid_dir = os.path.join(self.silu_root, sid)
-            if not os.path.isdir(sid_dir): continue
-            data[sid] = {}
+    def _build_index(self):
+        index = {}
+        print(f"--- 🔍 正在建立数据集索引: {self.data_root} ---")
+        for sub in self.subjects:
+            index[sub] = {}
+            sub_path = os.path.join(self.data_root, sub)
+            for cond in os.listdir(sub_path):
+                # 我们暂时不区分 cond，或者在后续逻辑中筛选 NM
+                cond_path = os.path.join(sub_path, cond)
+                if not os.path.isdir(cond_path): continue
+                for view in os.listdir(cond_path):
+                    view_path = os.path.join(cond_path, view)
+                    if not os.path.isdir(view_path): continue
+                    if view not in index[sub]: index[sub][view] = []
+                    for pkl in os.listdir(view_path):
+                        if pkl.endswith('.pkl'):
+                            index[sub][view].append(os.path.join(view_path, pkl))
+        return index
 
-            for cond in sorted(os.listdir(sid_dir)):
-                cond_dir = os.path.join(sid_dir, cond)
-                if not os.path.isdir(cond_dir): continue
-                data[sid][cond] = {}
-
-                for item in sorted(os.listdir(cond_dir)):
-                    item_path = os.path.join(cond_dir, item)
-                    if item.endswith('.pkl'):
-                        view_name = item.replace('.pkl', '')
-                        data[sid][cond][view_name] = item_path
-                    elif os.path.isdir(item_path):
-                        view_name = item
-                        pkls = [p for p in os.listdir(item_path) if p.endswith('.pkl')]
-                        if pkls:
-                            data[sid][cond][view_name] = os.path.join(item_path, pkls[0])
-        return data
-
-    def load_sequence(self, pkl_path):
-        """将轮廓序列转化为 (T, 3, 224, 224) 适配 ResNet"""
+    def load_frames(self, pkl_path):
+        """
+        核心加载函数：包含读取、采样、重心对齐
+        """
         try:
             with open(pkl_path, 'rb') as f:
-                seq_data = pickle.load(f)
-            if isinstance(seq_data, list): seq_data = np.array(seq_data)
-
-            if seq_data.shape[0] > self.target_len:
-                indices = np.linspace(0, seq_data.shape[0] - 1, self.target_len, dtype=int)
-                seq_data = seq_data[indices]
-
-            imgs = []
-            for i in range(len(seq_data)):
-                img = seq_data[i]
-                if img is not None and img.size > 0:
-                    img = cv2.resize(img, (224, 224))
-                else:
-                    img = np.zeros((224, 224), dtype=np.float32)
-
-                img = img.astype(np.float32) / 255.0
-                img = np.stack([img, img, img], axis=0)
-                imgs.append(torch.from_numpy(img))
-
-            while len(imgs) < self.target_len:
-                imgs.append(torch.zeros(3, 224, 224))
-            return torch.stack(imgs)
+                data = pickle.load(f)
         except:
-            return torch.zeros(self.target_len, 3, 224, 224)
+            # 容错处理
+            return torch.zeros(self.target_len, 3, *self.img_size)
+
+        # 采样 T 帧
+        if len(data) >= self.target_len:
+            start = random.randint(0, len(data) - self.target_len)
+            frames = data[start:start + self.target_len]
+        else:
+            # 帧数不足循环补齐
+            indices = np.arange(len(data))
+            pad = np.random.choice(indices, self.target_len - len(data))
+            frames = np.concatenate([data, data[pad]], axis=0)
+
+        processed = []
+        for frame in frames:
+            # 执行对齐！
+            aligned = align_silhouette(frame, target_size=self.img_size)
+            # 扩展为 3 通道 Tensor
+            processed.append(self.transform(aligned))
+
+        return torch.stack(processed)  # [T, 3, H, W]
 
 
 class FewShotSampler:
-    def __init__(self, dataset, n_way, k_shot, q_query):
+    """
+    强化版多视角采样器 (Multi-View Prototype Sampler)
+    核心逻辑：
+    1. Support Set 包含同一个人在不同视角下的样本，强制 Prototype 融合多视角信息。
+    2. Query Set 采样自该人未在 Support 中出现的视角，强制跨视角推理。
+    """
+
+    def __init__(self, dataset, n_way=5, k_shot=5, q_query=10):
         self.dataset = dataset
         self.n_way = n_way
         self.k_shot = k_shot
         self.q_query = q_query
+        self.all_views = ['000', '018', '036', '054', '072', '090', '108', '126', '144', '162', '180']
 
-        self.target_views = ['090', '180', '054']
-        self.view_to_ids = {v: [] for v in self.target_views}
+    def get_episode(self, mode='train'):
+        # 选取 N-Way 个受试者
+        train_subs = self.dataset.subjects[:74]
+        selected_subs = random.sample(train_subs, self.n_way)
 
-        for sid, cond_dict in dataset.all_sequences.items():
-            for cond, view_dict in cond_dict.items():
-                for v in self.target_views:
-                    if v in view_dict:
-                        if sid not in self.view_to_ids[v]:
-                            self.view_to_ids[v].append(sid)
+        all_x, all_y = [], []
 
-        self.active_views = []
-        print("--- 🔍 Visual Sampler Health Check ---")
-        for v in self.target_views:
-            count = len(self.view_to_ids[v])
-            if count >= self.n_way:
-                self.active_views.append(v)
-                print(f"✅ View {v}: {count} subjects")
-            else:
-                print(f"❌ View {v}: {count} subjects (Skipped)")
+        for label, sub in enumerate(selected_subs):
+            # 获取该受试者拥有的所有视角
+            available_views = list(self.dataset.index[sub].keys())
 
-        ids = dataset.all_subject_ids
-        random.seed(42)
-        shuffled = ids[:]
-        random.shuffle(shuffled)
-        split = int(0.8 * len(shuffled))
-        self.train_ids = shuffled[:split]
-        self.test_ids = shuffled[split:]
+            # 🌟 1. 构造 Multi-View Support Set
+            # 随机选 K 个不同视角作为 Support
+            s_views = random.sample(available_views, min(self.k_shot, len(available_views)))
+            # 如果视角不够 K 个，则允许部分重复
+            if len(s_views) < self.k_shot:
+                s_views += random.choices(available_views, k=self.k_shot - len(s_views))
 
-    def get_episode(self, mode="train"):
-        episode_view = random.choice(self.active_views if self.active_views else ['all'])
-        pool = self.train_ids if mode == "train" else self.test_ids
-        candidates = [sid for sid in pool if sid in self.view_to_ids.get(episode_view, [])]
+            for v in s_views:
+                p = random.choice(self.dataset.index[sub][v])
+                all_x.append(self.dataset.load_frames(p))
+                all_y.append(label)
 
-        if len(candidates) < self.n_way:
-            candidates = self.view_to_ids.get(episode_view, self.dataset.all_subject_ids)
+            # 🌟 2. 构造 Cross-View Query Set
+            # 排除掉 Support 用过的视角，从剩余视角里选
+            remaining_views = [v for v in available_views if v not in s_views]
+            if not remaining_views:  # 极端情况：如果没剩下视角了，就全量选
+                remaining_views = available_views
 
-        sampled_ids = random.sample(candidates, self.n_way)
-        X, Y = [], []
-        view_stats = {v: 0 for v in self.target_views}
+            q_view = random.choice(remaining_views)
+            q_pool = self.dataset.index[sub][q_view]
 
-        for cls_idx, sid in enumerate(sampled_ids):
-            all_seq_paths = []
-            if sid in self.dataset.all_sequences:
-                for cond in self.dataset.all_sequences[sid]:
-                    if episode_view in self.dataset.all_sequences[sid][cond]:
-                        all_seq_paths.append(self.dataset.all_sequences[sid][cond][episode_view])
+            # 采样 Query 样本
+            q_paths = random.choices(q_pool, k=self.q_query)
+            for p in q_paths:
+                all_x.append(self.dataset.load_frames(p))
+                all_y.append(label)
 
-            needed = self.k_shot + self.q_query
-            if not all_seq_paths:
-                selected_paths = [None] * needed
-            else:
-                selected_paths = random.sample(all_seq_paths * (needed // len(all_seq_paths) + 1), needed)
+        X = torch.stack(all_x)  # [N*(K+Q), T, 3, H, W]
+        Y = torch.tensor(all_y)
 
-            for pkl_path in selected_paths:
-                view_stats[episode_view] = view_stats.get(episode_view, 0) + 1
-                if pkl_path:
-                    X.append(self.dataset.load_sequence(pkl_path))
-                else:
-                    X.append(torch.zeros(self.dataset.target_len, 3, 224, 224))
-                Y.append(cls_idx)
-
-        X = torch.stack(X)
-        return X, torch.tensor(Y), torch.ones(X.shape[0], X.shape[1]), view_stats
-
-
-# --- 🔥 Main 测试代码 🔥 ---
-if __name__ == "__main__":
-    # 1. 设置路径 (请根据你的实际路径修改)
-    SILU_PATH = "/datasets/CASIA-B/silu"
-
-    # 2. 检查路径是否存在
-    if not os.path.exists(SILU_PATH):
-        print(f"❌ 错误: 路径 {SILU_PATH} 不存在。请修改 SILU_PATH 变量。")
-    else:
-        # 3. 初始化数据集
-        ds = CASIASiluDataset(silu_root=SILU_PATH, target_len=8)
-
-        # 4. 初始化采样器 (5-way 1-shot 1-query 用于快速测试)
-        n_way, k_shot, q_query = 5, 1, 1
-        sampler = FewShotSampler(ds, n_way=n_way, k_shot=k_shot, q_query=q_query)
-
-        print("\n--- 🚀 正在模拟获取一个训练 Episode ---")
-        X, Y, W, V = sampler.get_episode(mode="train")
-
-        # 5. 打印结果检查
-        print(f"✅ 图像张量形状 [B, T, C, H, W]: {X.shape}")
-        # 预期输出: [10, 8, 3, 224, 224] (因为 5-way * (1+1) = 10)
-
-        print(f"✅ 标签张量 [B]: {Y}")
-        print(f"✅ 视角锁定统计: {V}")
-
-        # 6. 检查像素值范围
-        print(f"✅ 像素值范围: [{X.min():.2f}, {X.max():.2f}] (预期 [0.00, 1.00])")
-
-        # 7. 模拟多次采样，检查视角锁死逻辑是否生效
-        print("\n--- 🚀 视角锁死逻辑稳定性测试 ---")
-        for i in range(3):
-            _, _, _, v_stats = sampler.get_episode()
-            active_v = [k for k, val in v_stats.items() if val > 0]
-            print(f"Episode {i + 1} 锁定的视角为: {active_v}")
+        return X, Y, None, {}

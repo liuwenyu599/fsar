@@ -1,44 +1,22 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# 确保以下组件路径在你的项目中正确
-from models.backbones.visual_resnet import VisualBackbone
+
+# 🌟 从 visual_resnet 导入 HPM 和 VisualBackbone
+from models.backbones.visual_resnet import VisualBackbone, HPM
 from models.backbones.structural import StructuralBackbone
 from models.heads.projections import ProjectionHead
 from models.heads.ppm import ViewAwarePPM
 from models.decoders.fam_fusion import FAMFusion
 
-
-class HPM(nn.Module):
-    """
-    水平金字塔映射 (Horizontal Pyramid Mapping)
-    将特征图在高度维度切分为不同的条带（Bins），提取局部步态细节
-    """
-
-    def __init__(self, bin_list=[1, 2, 4, 8]):
-        super(HPM, self).__init__()
-        self.bin_list = bin_list
-
-    def forward(self, x):
-        # x 形状: [N, C, H, W]
-        n, c, h, w = x.size()
-        features = []
-        for b in self.bin_list:
-            # 沿高度 H 方向均匀切分为 b 个块
-            z = F.adaptive_max_pool2d(x, (b, 1))  # [N, C, b, 1]
-            features.append(z.view(n, -1))  # 展平 [N, C*b]
-        return torch.cat(features, dim=-1)
-
-
 class PAGFSLModel(nn.Module):
     def __init__(self, common_dim=512, lora_rank=16):
         super().__init__()
-        self.debug_once = True  # 🌟 维度自检开关
+        self.debug_once = True
 
-        # 1. 视觉流: ResNet + HPM
+        # 1. 视觉流
         self.vis_backbone = VisualBackbone(lora_rank=lora_rank, pretrained=True)
         self.hpm = HPM(bin_list=[1, 2, 4, 8])
-        # 假设 ResNet 输出通道为 512 (如 ResNet18/34)
         vis_hpm_dim = 512 * sum([1, 2, 4, 8])
 
         # 2. 结构流: DSTformer (LoRA 增强版)
